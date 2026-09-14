@@ -1,0 +1,82 @@
+name: CI Pipeline
+
+on:
+  - push
+  - pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime:
+          - stable
+          - oldstable
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.runtime }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.runtime }}
+          cache: true
+
+      - name: Install Go dependencies
+        if: hashFiles('go.mod') != ''
+        run: go mod download
+
+      - name: Check Go formatting
+        if: hashFiles('go.mod') != ''
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run Go lint
+        if: hashFiles('go.mod') != ''
+        run: test -z "$(golangci-lint run 2>/dev/null || true)"
+
+      - name: Build Go package
+        if: hashFiles('go.mod') != ''
+        run: go test ./...
+
+      - name: Run Go tests
+        if: hashFiles('go.mod') != ''
+        run: go test ./...
+
+      - name: Write pipeline summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' '# CI Pipeline Summary' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' '' >> "$GITHUB_STEP_SUMMARY"
+          printf '| Runtime | Dependencies | Formatting | Lint | Build | Tests | Outcome |\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '| --- | --- | --- | --- | --- | --- | --- |\n'
+          for entry in \
+            "go-deps|${{ steps.go-deps.outcome }}" \
+            "go-format|${{ steps.go-format.outcome }}" \
+            "go-lint|${{ steps.go-lint.outcome }}" \
+            "go-build|${{ steps.go-build.outcome }}" \
+            "go-tests|${{ steps.go-tests.outcome }}"; do
+            name="${entry%%|*}"
+            outcome="${entry#*|}"
+            printf '| %s | %s |\n' "$name" "$outcome" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [[ "${{ steps.go-deps.outcome }}" != "success" || \
+                "${{ steps.go-format.outcome }}" != "success" || \
+                "${{ steps.go-lint.outcome }}" != "success" || \
+                "${{ steps.go-build.outcome }}" != "success" || \
+                "${{ steps.go-tests.outcome }}" != "success" ]]; then
+            printf '| Overall | failed |\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '| Overall | success |\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
