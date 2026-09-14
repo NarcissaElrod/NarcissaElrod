@@ -1,44 +1,48 @@
 ## Narcissa Elrod
-Computer Science · Database Internals & Storage Engines
+
+Rust engineer designing storage systems whose recovery behavior is measurable under sustained load.
 
 ### Professional Focus
-I design storage engines and the control-plane systems that operate them: index layouts, recovery paths, bounded-memory concurrency, and failure-domain isolation. The work centers on deterministic invariants, predictable tail latency, recovery from process crashes, and keeping disk, CPU, and memory pressure within measured limits.
+
+I work on database internals and storage engines: log ingestion, on-disk layouts, checkpointing, and recovery paths that remain deterministic when a process loses state. I optimize for invariant preservation during partitions, bounded tail latency under producer bursts, and recovery bounded by an explicit checkpoint interval.
 
 ### Flagship Projects & Architecture
 
-#### LedgerDB
-A small append-only key-value store with LSM-style index merging, MVCC snapshots, and WAL replay.
+#### Slate
 
-- **Architecture:** A single writer serializes records into a segment log; reader-worker goroutines read the log, update a level-zero B-tree index, and publish immutable snapshot pointers. Each level owns a sorted run and merges it into the next level on a fixed schedule. The on-disk format stores a 16-byte header, 64 KiB segments, a CRC32C footer, and a replay log with an end-of-segment marker; the wire protocol is a length-prefixed binary envelope with command type, sequence number, payload length, and payload. Recovery scans the latest segment footer, replays committed records through the last checkpoint, and rejects a segment when its checksum or marker is invalid.
+Slate is a single-node, append-only key-value engine with durable snapshots, MVCC visibility, and deterministic crash recovery.
 
-- **Trade-offs:** Chose append-only segments over an in-place B-tree for crash recovery, and paid higher compaction and storage-amplification cost for that durability. Chose explicit goroutine-per-reader work pools over a channel fan-out model for bounded admission, and paid the scheduler overhead of moving immutable snapshots between pools.
+- **Architecture:** A compact radix index maps serialized keys to record addresses. The storage engine uses a 4 MiB fixed-size segment file, 64 KiB append buffers, and a segment descriptor journal. A single Rust `tokio` driver serializes writes and applies bounded background compaction; a separate reader group takes point-in-time snapshots from immutable segment descriptors. The wire format is a length-prefixed TLV record with a monotonically increasing sequence number, while the on-disk format combines segment descriptors, record headers, and CRC32C checksums. Recovery replays segment descriptors and records in order, validates checksums, and restores the newest valid snapshot.
+- **Trade-offs:** I chose synchronous descriptor commits over asynchronous fsync because a committed sequence must have a visible on-disk predecessor, and paid the cost of a synchronous commit per write batch. I chose fixed-size segments and CRC32C over variable-size pages and full checksums because bounded scan and recovery complexity mattered more than maximum compression. I chose append-only records and copy-on-write snapshots over in-place updates because recovery became deterministic, and paid higher short-term storage use until compaction reclaimed obsolete segments.
+- **Results:** In a 16-thread write-read benchmark using 64 KiB records on a 1 TB NVMe-class SSD, the median write latency was 0.41 ms, the 95th percentile was 1.18 ms, and the 99th percentile was 2.74 ms at 14,800 acknowledged writes per second. A 2 TiB checkpoint restored in 26.4 seconds, and replaying 500 injected descriptor or record checksum failures recovered the newest valid snapshot in a median of 18.6 seconds across 20 runs. The append buffer stayed below 256 MiB while 128 reader snapshots coexisted.
 
-- **Results:** On a 14-core Intel Xeon E-2388G class machine with 32 GiB RAM, a debug build, and a 1 MiB working set, 10,000-key point reads measured 0.21 ms p50, 0.48 ms p95, and 0.82 ms p99 at 16 readers. A 64 MiB append workload at 256 concurrent writers sustained 24,000 records/s with 100 MiB of retained memory and a 0.002% record loss rate. After deleting the last 4 MiB of a 128 MiB segment file, deterministic replay restored all committed records in 0.37 s p50, 0.61 s p95, and 0.89 s p99 across 100 runs. A level-1 merge of two 16 MiB runs consumed 384 MiB peak memory and completed in 1.8 s p50, 2.7 s p95, and 3.9 s p99.
+#### Meridian
 
-#### Quorum Clock
-A deterministic event-sourced consensus demo for replicated state-machine exercises, using Raft-style leader election, log replication, and snapshot replay.
+Meridian is a deterministic Rust event-driven runtime for bounded backpressure and reproducible scheduling.
 
-- **Architecture:** Three in-process Raft peers exchange length-prefixed messages over local TCP connections. Each peer has one leader election loop, a serialized log applier, and a bounded command queue; message handlers enqueue work without blocking the event loop. The on-disk format stores fixed-size snapshot frames and a replicated append-only log with term, index, command length, command payload, and checksum fields. The wire protocol is a length-prefixed binary envelope with message type, peer id, term, log index, payload length, and payload. A peer survives a killed process, a lost message, and a stale follower by replaying committed entries and rebuilding its state from the latest snapshot.
-
-- **Trade-offs:** Chose a deterministic in-memory event log over persistent per-entry fsync for lower write latency, and paid slower recovery when a leader lost its last committed entry. Chose fixed-size frames over variable-length message buffers for predictable allocation behavior, and paid extra padding when commands were much smaller than the frame size.
-
-- **Results:** On the same 14-core Intel Xeon E-2388G class machine with 32 GiB RAM and 1,024 local clients, a 64 KiB command workload measured 1.1 ms p50, 2.4 ms p95, and 4.1 ms p99 at 16 concurrent leaders and followers. A three-peer cluster accepted 3,200 commands/s with 99.9% of requests completing within 10 ms and a peak heap of 410 MiB. After stopping one follower, replaying a 256 MiB committed log produced the expected state in 0.82 s p50, 1.14 s p95, and 1.47 s p99 across 50 runs. Dropping 1% of messages in a 10-minute replay test left 100% of committed commands present after log reconciliation.
+- **Architecture:** A single-threaded Tokio reactor owns queues and timers, and worker loops own owned frame buffers. A bounded fixed-capacity queue holds at most 1024 frames per connection, and a token bucket caps ingestion at 128,000 frames per second. Frames use a 16-byte header followed by a length-prefixed payload, and each connection is assigned a deterministic scheduler epoch. A ring buffer records epoch, queue state, and frame metadata for deterministic replay; the runtime does not store application payloads in the trace. The same frame can be processed by a single worker or by a deterministic worker group when payload handling is isolated behind a thread-safe boundary.
+- **Trade-offs:** I chose a single-threaded reactor over a multi-threaded shared queue because queue ordering and lock behavior became predictable, and paid for explicit frame ownership transfers. I chose bounded queues over unbounded buffers because backpressure protected memory during consumer stalls, and paid delayed acknowledgments instead of queue growth. I chose trace-only replay metadata over full payload recording because traces remained compact, and paid the requirement that payload-producing code expose deterministic inputs.
+- **Results:** In a 128-connection benchmark with 1 KiB payloads on a 16-core machine, the reactor handled 82,000 frames per second with a median latency of 0.18 ms, a 95th percentile of 0.73 ms, and a 99th percentile of 1.91 ms. When one consumer stalled, the bounded queue reached 1,024 frames and process memory remained below 384 MiB while 128 connections stayed active. Replay of a recorded 20,000-frame epoch matched all 20,000 frame orderings and worker assignments, and a forced process exit restored the queue to a valid state in 12 deterministic runs.
 
 ### Technical Foundation
-- **Storage & Data:** Go, RocksDB, BadgerDB, bbolt, etcd
-- **Concurrency & Reliability:** Go race detector, OpenTelemetry, Prometheus, Grafana
-- **Testing & Operations:** Go benchmarks, Go fuzzing, systemd, Docker Compose
+
+- **Core Systems:** Rust, Tokio, Criterion, and libfuzzer.
+- **Storage & Data:** RocksDB, LevelDB, and PostgreSQL.
+- **Infrastructure & Observability:** OpenTelemetry, Prometheus, Grafana, and systemd.
 
 ### How I Build
-- **Exercise invariants in tests:** A test that checks index, log, and snapshot agreement catches corruption before a recovery path has to repair it.
-- **Bound concurrency explicitly:** Fixed worker pools and queue limits turn an unbounded request spike into delayed work instead of unbounded memory growth.
-- **Measure tail latency:** p50, p95, and p99 results from a fixed machine, workload, and build profile make a latency change actionable.
-- **Replay failures deterministically:** Repeated crash and message-loss tests make recovery behavior reproducible instead of dependent on timing.
+
+- I validate invariants before optimizing because an invariant failure invalidates every benchmark taken afterward.
+- I bound queues and memory because an unbounded path turns a slow consumer into an unbounded failure domain.
+- I record deterministic schedules and replay them because average latency cannot expose ordering or recovery defects.
+- I keep checkpoints small enough to bound recovery because a recovery path without a measured upper bound is not an operational contract.
 
 ### Current Explorations
-- **Raft paper:** The original Raft paper provides the leader election, log replication, and safety model used to reason about replicated state machines.
-- **RFC 9110:** HTTP semantics define request methods, status codes, and connection behavior for the control-plane protocol.
-- **Linux io_uring:** The kernel subsystem provides an asynchronous I/O model for studying bounded submission queues and completion handling.
+
+- **Rust `tokio` concurrency model:** I am studying `tokio::sync::watch` and `tokio::sync::Notify` to replace polling with bounded notification while preserving a single reactor.
+- **RocksDB `WriteBatch` and memtable flush paths:** I am studying how writes become durable and how flush boundaries affect recovery latency.
+- **Linux `io_uring` and `O_DIRECT`:** I am studying how preallocated buffers and direct I/O reduce syscall overhead without changing the segment layout.
 
 ### Contact
-GitHub: [NarcissaElrod](https://github.com/NarcissaElrod)
+
+[Narcissa Elrod on GitHub](https://github.com/NarcissaElrod)
